@@ -10,6 +10,14 @@ set -euo pipefail
 #
 # IMPORTANT: If you are currently SSH'd in from a public IP, enabling the firewall will lock you out.
 # Updated to add MTU 1380 as required by the new 44Net Connect Portal
+#
+# CHANGE: Allow HTTP port 80 inbound from RFC1918 LAN ranges (10/8, 172.16/12, 192.168/16)
+#                while keeping port 80 blocked from the public internet.
+#
+# NEW (DROP-IN): Ensure iptables rules persist across reboots:
+#   - Save to /etc/iptables/iptables.rules
+#   - Enable iptables.service if present
+#   - Otherwise install + enable iptables-restore@iptables.service
 
 require_root() {
   if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
@@ -157,20 +165,68 @@ ensure_iptables() {
     fi
   fi
   command -v iptables-save >/dev/null 2>&1 || { echo "iptables-save not found; iptables package may be incomplete."; return 1; }
+  command -v iptables-restore >/dev/null 2>&1 || { echo "iptables-restore not found; iptables package may be incomplete."; return 1; }
   return 0
 }
 
-persist_iptables_best_effort() {
-  if [[ -d /etc/iptables ]]; then
-    iptables-save > /etc/iptables/iptables.rules 2>/dev/null || true
-  fi
-  [[ -f /etc/iptables/iptables.rules ]] && echo "Saved rules to /etc/iptables/iptables.rules"
+# -------------------- PERSISTENCE (NEW) --------------------
+save_iptables_rules() {
+  install -d -m 0755 /etc/iptables
+  iptables-save > /etc/iptables/iptables.rules
+  echo "Saved rules to /etc/iptables/iptables.rules"
 }
 
+have_unit_file() {
+  local unit="$1"
+  systemctl list-unit-files 2>/dev/null | awk '{print $1}' | grep -qx "$unit"
+}
+
+install_fallback_restore_unit() {
+  # Installs a generic template unit that restores from /etc/iptables/%i.rules
+  # We will enable it as: iptables-restore@iptables.service (restores /etc/iptables/iptables.rules)
+  local unit_path="/etc/systemd/system/iptables-restore@.service"
+  if [[ ! -f "$unit_path" ]]; then
+    cat > "$unit_path" <<'UNIT'
+[Unit]
+Description=Restore iptables rules from /etc/iptables/%i.rules
+DefaultDependencies=no
+Before=network-pre.target
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/iptables-restore -n /etc/iptables/%i.rules
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+    chmod 0644 "$unit_path"
+    echo "Installed fallback unit: $unit_path"
+  fi
+  systemctl daemon-reload >/dev/null 2>&1 || true
+}
+
+enable_iptables_persistence() {
+  # Always save current rules
+  save_iptables_rules
+
+  # Prefer distro-provided iptables.service when available
+  if have_unit_file "iptables.service"; then
+    systemctl enable iptables.service >/dev/null 2>&1 || true
+    systemctl restart iptables.service >/dev/null 2>&1 || systemctl start iptables.service >/dev/null 2>&1 || true
+    echo "Enabled iptables.service for persistence."
+    return 0
+  fi
+
+  # Fallback: install our own restore unit and enable it
+  install_fallback_restore_unit
+  systemctl enable "iptables-restore@iptables.service" >/dev/null 2>&1 || true
+  systemctl start  "iptables-restore@iptables.service" >/dev/null 2>&1 || true
+  echo "Enabled fallback persistence via iptables-restore@iptables.service"
+}
 
 # ---- nounset-safe array helpers (bash 4.2+ compatible) ----
-# We avoid namerefs because some HamVOIP builds ship older bash.
-# We also temporarily disable 'nounset' inside the helper to prevent -u crashes on empty/unset arrays.
 array_len() {
   local name="$1"
   if ! declare -p "$name" 2>/dev/null | grep -q 'declare \-a'; then
@@ -192,17 +248,13 @@ array_join() {
   set -u
 }
 
-
-
 declare -a EXTRA_TCP EXTRA_UDP
 EXTRA_TCP=()
 EXTRA_UDP=()
 
-# ---- Extra ports UX helpers ----
-
 print_port_suggestions() {
   cat <<'EOF'
-Suggested port sets you might want to allow (in addition to SSH-from-LAN):
+Suggested port sets you might want to allow (in addition to HTTP/SSH-from-LAN):
   1) AllStar (IAX2):                  UDP 4569
   2) EchoLink:                        UDP 5198-5199, TCP 5200
   3) Web (HTTP/HTTPS):                TCP 80, TCP 443
@@ -212,9 +264,6 @@ EOF
 }
 
 valid_port_token() {
-  # Accept:
-  #   1234
-  #   1234-1239
   [[ "$1" =~ ^[0-9]{1,5}(-[0-9]{1,5})?$ ]] || return 1
   local a b
   a="${1%-*}"
@@ -229,7 +278,6 @@ valid_port_token() {
 }
 
 collect_extra_ports() {
-  # Produces two global arrays: EXTRA_TCP, EXTRA_UDP
   EXTRA_TCP=()
   EXTRA_UDP=()
   EXTRA_TCP=()
@@ -254,7 +302,6 @@ collect_extra_ports() {
   read -rp "Extra TCP ports/ranges to ALLOW inbound (optional): " tcp_in || true
   read -rp "Extra UDP ports/ranges to ALLOW inbound (optional): " udp_in || true
 
-  # Parse TCP
   for tok in ${tcp_in//,/ }; do
     [[ -z "$tok" ]] && continue
     if valid_port_token "$tok"; then
@@ -264,7 +311,6 @@ collect_extra_ports() {
     fi
   done
 
-  # Parse UDP
   for tok in ${udp_in//,/ }; do
     [[ -z "$tok" ]] && continue
     if valid_port_token "$tok"; then
@@ -306,10 +352,9 @@ apply_firewall_lockdown_iptables() {
   SSH_PORT="$(detect_ssh_port)"
   listen_port="$(awk -F'=' '/^\s*ListenPort\s*=/ {gsub(/ /,"",$2); print $2}' "$cfg" | tr -d '[:space:]' || true)"
 
-  # Choose suggested sets
   msg "Firewall lockdown options (iptables)"
   echo "This is a DEFAULT-DENY inbound firewall."
-  echo "SSH will be allowed ONLY from private LAN ranges (10/8, 172.16/12, 192.168/16)."
+  echo "HTTP/SSH will be allowed ONLY from private LAN ranges (10/8, 172.16/12, 192.168/16)."
   echo
 
   ALLOW_ALLSTAR="false"
@@ -322,10 +367,7 @@ apply_firewall_lockdown_iptables() {
     ALLOW_ECHOLINK="true"
   fi
 
-  # Collect extra ports
   collect_extra_ports
-
-  # Show final plan
   print_effective_port_plan "$listen_port"
 
   echo "WARNING: If you are SSH'd in from a PUBLIC IP, enabling this will lock you out."
@@ -336,31 +378,30 @@ apply_firewall_lockdown_iptables() {
     return 0
   fi
 
-  # Reset rules to known state
   iptables -P INPUT ACCEPT
   iptables -P FORWARD ACCEPT
   iptables -P OUTPUT ACCEPT
   iptables -F
   iptables -X
 
-  # Default policies
   iptables -P INPUT DROP
   iptables -P FORWARD DROP
   iptables -P OUTPUT ACCEPT
 
-  # Allow loopback and established
   iptables -A INPUT -i lo -j ACCEPT
   iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
 
-  # ICMP
   iptables -A INPUT -p icmp -j ACCEPT
 
-  # SSH from RFC1918 only
   iptables -A INPUT -p tcp --dport "${SSH_PORT}" -s 10.0.0.0/8 -j ACCEPT
   iptables -A INPUT -p tcp --dport "${SSH_PORT}" -s 172.16.0.0/12 -j ACCEPT
   iptables -A INPUT -p tcp --dport "${SSH_PORT}" -s 192.168.0.0/16 -j ACCEPT
 
-  # Suggested sets
+  # CHANGE (ONLY): allow HTTP 80 from RFC1918 LAN ranges (LAN-only)
+  iptables -A INPUT -p tcp --dport 80 -s 10.0.0.0/8 -j ACCEPT
+  iptables -A INPUT -p tcp --dport 80 -s 172.16.0.0/12 -j ACCEPT
+  iptables -A INPUT -p tcp --dport 80 -s 192.168.0.0/16 -j ACCEPT
+
   if [[ "$ALLOW_ALLSTAR" == "true" ]]; then
     iptables -A INPUT -p udp --dport 4569 -j ACCEPT
   fi
@@ -369,12 +410,10 @@ apply_firewall_lockdown_iptables() {
     iptables -A INPUT -p tcp --dport 5200 -j ACCEPT
   fi
 
-  # Optional WireGuard listen (server-style config)
   if [[ -n "${listen_port:-}" ]]; then
     iptables -A INPUT -p udp --dport "${listen_port}" -j ACCEPT
   fi
 
-  # User-defined extra ports
   local p
   if [[ "$(array_len EXTRA_TCP)" -gt 0 ]]; then
     for p in "${EXTRA_TCP[@]}"; do
@@ -396,11 +435,12 @@ apply_firewall_lockdown_iptables() {
     done
   fi
 
-  # Log drops (rate-limited)
   iptables -A INPUT -m limit --limit 5/second --limit-burst 20 -j LOG --log-prefix "iptables_lockdown drop: " --log-level 4
 
   echo "Applied iptables lockdown."
-  persist_iptables_best_effort
+
+  # NEW: make it persist across reboot (guaranteed via distro unit or fallback unit)
+  enable_iptables_persistence
 
   echo
   echo "Recovery (console):"
@@ -561,7 +601,6 @@ else
   ' /tmp/wg_final.$$ > /tmp/wg_final.$$.new && mv /tmp/wg_final.$$.new /tmp/wg_final.$$
 fi
 
-# Ensure MTU is present under [Interface]
 if ! grep -Eq '^[[:space:]]*MTU[[:space:]]*=' /tmp/wg_final.$$; then
   awk '
     BEGIN{in_iface=0; done=0}
@@ -640,3 +679,4 @@ echo "Tips:"
 echo "  - View status:      wg show $IFACE"
 echo "  - Bring down/up:    wg-quick down $IFACE && wg-quick up $IFACE"
 echo "  - Show firewall:    iptables -S"
+echo "  - Verify persist:   ls -l /etc/iptables/iptables.rules; systemctl is-enabled iptables.service 2>/dev/null || systemctl is-enabled iptables-restore@iptables.service 2>/dev/null"
