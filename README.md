@@ -88,7 +88,7 @@ If enabled, the script applies a **default-deny inbound firewall** with:
 - Loopback
 - Established/related connections
 - ICMP
-- SSH **only from RFC1918 LAN ranges**
+- HTTP/SSH **only from RFC1918 LAN ranges**
 
 ### Optional Service Sets
 - AllStarLink: `UDP 4569`
